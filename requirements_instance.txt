@@ -1,0 +1,28 @@
+# Requirements for Instance Classification Pipeline
+#
+# Install with: pip install -r requirements_instance.txt
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+pillow>=9.5.0
+
+# ML and metrics
+scikit-learn>=1.3.0
+timm>=0.9.0  # PyTorch Image Models for encoders
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Data handling
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Logging (optional)
+wandb>=0.15.0  # For experiment tracking
+
+# Note: sam2 should be installed separately following SAM2's instructions
+# opencv-python NOT required (we use PIL instead)
+

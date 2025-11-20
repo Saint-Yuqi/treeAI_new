@@ -1,0 +1,132 @@
+---
+name: Tree Species Segmentation with Fine-tuned SAM2
+If there is AGENTS.md ，don't forget to reference the AGENTS.md file. 
+Don't write separate Usage Documentation. simlpy tell me the usage or just add it in the Readme.md file..
+globs:
+  - "src/**"
+  - "models/sam2_finetune/**"
+  - "evaluation/**"
+  - "configs/**"
+  - "scripts/**"
+  - "*.py"
+  - "**/*.yaml"
+  - "**/*.yml"
+  - "**/*.sh"
+  - "pyproject.toml"
+  - "setup.cfg"
+rules:
+  - id: sam2_structure_preservation
+    description: |
+      Follow the original SAM2 model architecture strictly; avoid structural changes unless absolutely necessary.If a change is necessary (bug/security fix or minimal hook),
+      prefer subclassing/adapters under models/sam2_finetune/ and document the delta in README.md.
+    when:
+      - file_glob: "models/sam2_finetune/**/*.py"
+    do:
+      - enforce: "preserve SAM2 core interfaces"
+      - recommend: "extend via subclass/adapters; document divergences"
+      - disallow: "broad rewrites of upstream core modules"
+
+  - id: cautious_test_file_creation
+    description: |
+      Keep the test suite lean. Prefer integration tests over many scattered unit tests.
+      For persistent bugs, mark failing tests as xfail with an issue link instead of frequent test churn.
+    when:
+      - file_glob: "tests/**/*.py"
+    do:
+      - warn_if: "new test files added > 3 per week"
+      - recommend: "keep test suite lean and focused"
+      - recommend: "prefer integration tests"
+      - enforce: "mark persistent failures as xfail with issue reference"
+      - discourage: "frequent addition/removal of tests for the same unresolved bug"
+
+  - id: code_style_consistency
+    description: |
+      Enforce SAM2-aligned code style on production code (src/**, models/**):
+      - snake_case for variables and functions
+      - type annotations on function signatures
+      - docstrings on public APIs
+      - modular, well-documented code
+      Exempt vendor/generated/experimental scripts.
+    when:
+      - file_glob: "src/**/*.py"
+      - file_glob: "models/**/*.py"
+
+    do:
+      - enforce: "snake_case naming"
+      - enforce: "type hints on function signatures"
+      - require: "docstrings on public classes/functions"
+
+  - id: unresolved_bug_policy
+    description: |
+      For bugs unresolved over a week, temporarily disable failing tests rather than continuously modifying or adding new tests.
+    when:
+      - file_glob: "tests/**/*.py"
+      - condition: "bug unresolved for > 7 days"
+    do:
+      - suggest: "comment out failing tests temporarily"
+      - discourage: "excessive test churn on persistent bugs"
+
+  - id: treeai_segmentation_evaluation
+    description: |
+      Metrics
+      - Overall Accuracy (OA)
+      - Precision (User's Accuracy, UA)
+      - Recall (Producer's Accuracy, PA)
+      - Intersection over Union (IoU)
+      - F1 Score
+
+      Advanced
+      - Support custom class-group averaging (custom_avg), e.g., bulk/medium/tail/dead-tree/invasive-alien
+      - Support precision/recall boosting based on uncertainty thresholds
+
+      Evaluation Types
+      - Dataset-level (evaluate_model): compute the confusion matrix and metrics over the entire test set
+      - Sample-level (evaluate_model_samplewise): compute per-sample metrics for detailed analysis
+
+      Visual Outputs
+      - Confusion matrices (4 normalization variants)
+      - Per-class score bar charts
+      - Qualitative results (RGB image, reference/ground-truth, prediction, uncertainty)
+
+      
+      Coding style for evaluation code should align with SAM2 project conventions.
+    when:
+      - file_glob: "evaluation/**"
+    do:
+      - enforce: "implement full metric suite as per TreeAI segmentation evaluation"
+      - recommend: "follow SAM2 style and modular code organization"
+
+  - id: usage_doc_policy
+    description: |
+      Usage documentation policy:
+      - Do NOT create separate usage/how-to files (e.g., USAGE.md, CLI.md, docs/usage/*.md).
+      - All usage instructions must live in the top-level README.md, written clearly and succinctly.
+      - Include the exact 'conda activate sam2' steps for this codebase named 'code' in README.md.
+      - When usage changes, update README.md rather than adding parallel documents.
+    when:
+      - file_glob: "**/*"
+    do:
+      - disallow: "creating separate usage/how-to docs"
+      - enforce: "centralize all usage instructions in README.md"
+      - recommend: "maintain a concise 'Usage' section in README.md with environment activation notes"
+  - id: lint_and_typecheck_enforcement
+    description: |
+      Enforce static quality gates:
+      - Ruff for linting (flake8/pycodestyle/pyflakes rules via ruff)
+      - Black for formatting (line length 100)
+      - isort for import ordering (black profile)
+      - Mypy for type checking (strict on src/** and models/**)
+      - pyproject.toml consistency (validate config)
+      - Python syntax/bytecode compilation check
+    when:
+      - file_glob: "src/**/*.py"
+      - file_glob: "models/**/*.py"
+      - file_glob: "utils/**/*.py"
+      - file_glob: "*.py"
+    do:
+      - enforce: "ruff lint passes (no errors)"
+      - enforce: "black formatting applied"
+      - enforce: "isort applied with black profile"
+      - enforce: "mypy passes on src/** and models/**"
+      - enforce: "python -m py_compile succeeds on repository *.py"
+      - recommend: "run pre-commit hooks locally before pushing"

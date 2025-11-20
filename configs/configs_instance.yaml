@@ -1,0 +1,137 @@
+# Configuration for Instance-level Tree Species Classification
+# This config is for training the instance classifier (not the semantic segmentation approach)
+
+# Dataset configuration
+dataset:
+  # Root directory where sam2_instances are stored
+  output_root: "./sam2_instances/12_RGB_SemSegm_640_fL"
+  
+  # Paths to instance manifests
+  train_manifest: "./sam2_instances/12_RGB_SemSegm_640_fL/train/instances_manifest.jsonl"
+  val_manifest: "./sam2_instances/12_RGB_SemSegm_640_fL/val/instances_manifest.jsonl"
+  test_manifest: "./sam2_instances/12_RGB_SemSegm_640_fL/test/instances_manifest.jsonl"
+  
+  # Path to TreeAI classes YAML (for colors, names, and groups)
+  classes_yaml: "/home/c/yuqyan/code/treeAI-segmentation/configs/data/treeAI_classes.yaml"
+  
+  # Number of tree species classes (excluding background)
+  # Labels in data: 1-61 → converted to 0-60 in code → num_classes=61
+  num_classes: 61
+  
+  # Data filtering
+  min_purity: 0.7      # Minimum purity threshold (0.7 = 70% label agreement)
+  min_area: 100        # Minimum mask area in pixels
+  
+  # Data loading
+  batch_size: 48       # Batch size for training
+  num_workers: 12       # Number of data loading workers
+  image_size: [224, 224]  # Image size for classifier (H, W)
+
+# Model configuration
+model:
+  # Model type: 'simple' (crop to bbox) or 'masked' (apply mask explicitly)
+  model_type: "masked"
+  
+  # Encoder architecture (any timm model)
+  # Options: resnet50, efficientnet_b0, efficientnet_b4, convnext_small, etc.
+  encoder: "resnet50"
+  
+  # Use ImageNet pretrained weights
+  pretrained: true
+  
+  # Dropout rate in classification head
+  dropout: 0.3
+  
+  # Use mask features (only for 'masked' model_type)
+  use_mask_features: false
+
+# Training configuration
+training:
+  # Number of epochs
+  epochs: 500
+  
+  # Learning rate
+  lr: 1.0e-4
+  
+  # Weight decay
+  weight_decay: 1.0e-4
+  
+  # Save checkpoint every N epochs
+  save_freq: 10
+  
+  # Output directory
+  output_dir: "./outputs/instance_classifier"
+  
+  # Resume training from checkpoint (optional)
+  # resume_from: "./outputs/instance_classifier/checkpoint_epoch_20.pt"
+
+# Visualization configuration
+visualization:
+  # Enable visualization
+  enabled: true
+  
+  # Path to pick dataset for qualitative visualization
+  pick_root: "/home/c/yuqyan/data/TreeAI/12_RGB_SemSegm_640_fL/pick"
+  
+  # Generate visualizations every N epochs (0 to disable)
+  viz_freq: 50
+  
+  # Number of samples to visualize (will show first N and last N)
+  num_samples: 5
+
+# Wandb configuration (for experiment tracking)
+wandb:
+  # Enable wandb logging
+  enabled: true
+  
+  # Wandb project name
+  project: "tree_instance"
+  
+  # Wandb entity/team name
+  entity: "stefaniehurschler-uzh"
+  
+  # Wandb run name (optional, will auto-generate if not provided)
+  # Useful format: "encoder_purity_date"
+  # Example: "resnet50_p07_20240120"
+  run_name: null
+
+# Device configuration
+device: "cuda"  # cuda or cpu
+
+# SAM2 instance precomputation configuration (for reference)
+# Use scripts/precompute_sam2_instances.py with configs/configs.yaml
+precompute:
+  # These settings are used by precompute_sam2_instances.py
+  # Not used by train_instance_classifier.py
+  sam2_checkpoint: "/home/c/yuqyan/code/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_tree_finetune.yaml/checkpoints/checkpoint.pt"
+  sam2_config: "sam2.1_hiera_b+"
+  rsprompter_checkpoint: "/home/c/yuqyan/code/RSPrompter/work_dirs/treeai/rsprompter/best_coco_bbox_mAP_epoch_50.pth"
+  rsprompter_config: "/home/c/yuqyan/code/RSPrompter/work_dirs/treeai/rsprompter/rsprompter_anchor_treeai.py"
+  bbox_prompt_dir: "./rsprompter_prompts"
+  output_dir: "./sam2_instances"
+  min_area: 100
+  min_overlap: 0.5
+
+# Recommended configurations for different scenarios
+# 
+# Fast training (for testing):
+#   model.encoder: "efficientnet_b0"
+#   dataset.batch_size: 64
+#   training.epochs: 20
+#
+# Balanced (default):
+#   model.encoder: "resnet50"
+#   dataset.batch_size: 32
+#   training.epochs: 50
+#
+# High accuracy:
+#   model.encoder: "convnext_small" or "efficientnet_b4"
+#   dataset.batch_size: 16
+#   training.epochs: 100
+#   dataset.image_size: [384, 384]
+#
+# Clean data only:
+#   dataset.min_purity: 0.85
+#
+# Include more data:
+#   dataset.min_purity: 0.6
