@@ -629,34 +629,6 @@ If you use this code, please cite:
 - SAM2: [Segment Anything Model 2](https://github.com/facebookresearch/segment-anything-2)
 - RSPrompter: [RSPrompter: Learn to Prompt for Remote Sensing Instance Segmentation](https://github.com/KyanChen/RSPrompter)
 
-## Philosophy
 
-This refactor follows Linus Torvalds' principles:
 
-1. **"Bad programmers worry about code. Good programmers worry about data structures."**
-   - Changed from pixels to instances as the fundamental unit
-   
-2. **"Good taste is eliminating special cases."**
-   - Removed mask-weighted loss, multi-scale fusion, pixel-level complexity
-   - Now: just load instance, extract features, classify
-   
-3. **"Theory and practice sometimes clash. Theory loses."**
-   - Semantic segmentation is theoretically "correct" but practically wrong
-   - Instance classification is theoretically "simple" but practically right
 
-4. **"If you need more than 3 levels of indentation, you're screwed."**
-   - Old code: deeply nested loops, cache management, special cases
-   - New code: flat, obvious, easy to read
-
-**Result: 90% less code, 10x faster, easier to improve.**
-
-## Related Documentation
-
-For more detailed information, see:
-
-- **[EVALUATION_STRATEGY.md](EVALUATION_STRATEGY.md)**: Detailed explanation of the evaluation strategy, metrics, and performance analysis
-- **[QUICKSTART.md](QUICKSTART.md)**: Quick start guide for running the instance classification pipeline
-- **[TESTING_GUIDE.md](TESTING_GUIDE.md)**: How to properly test models on the test set
-- **[CHANGES.md](CHANGES.md)**: Architectural refactoring rationale and changelog
-- **[VISUALIZATION_GUIDE.md](VISUALIZATION_GUIDE.md)**: Detailed guide on visualization features
-- **[PYTORCH_26_FIX.md](PYTORCH_26_FIX.md)**: PyTorch 2.6 compatibility fixes

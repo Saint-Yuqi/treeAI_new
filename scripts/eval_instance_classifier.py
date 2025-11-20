@@ -143,12 +143,13 @@ def plot_confusion_matrix(
     """Plot confusion matrix."""
     if normalize:
         cm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
+        cm = cm * 100  # Convert to percentage
     
     plt.figure(figsize=(12, 10))
     sns.heatmap(
         cm,
         annot=True,
-        fmt='.2f' if normalize else 'd',
+        fmt='.0f' if normalize else 'd',  # Use integer format for percentage
         cmap='Blues',
         square=True,
         cbar_kws={'label': 'Normalized Count' if normalize else 'Count'},

@@ -48,7 +48,7 @@ model:
 # Training configuration
 training:
   # Number of epochs
-  epochs: 500
+  epochs: 1
   
   # Learning rate
   lr: 1.0e-4
@@ -78,6 +78,15 @@ visualization:
   
   # Number of samples to visualize (will show first N and last N)
   num_samples: 5
+
+# Testing configuration
+testing:
+  # Automatically test on test set when training finishes
+  auto_test_on_finish: true
+  
+  # Test image and label directories (will be inferred from pick_root if not specified)
+  test_image_dir: "/home/c/yuqyan/data/TreeAI/12_RGB_SemSegm_640_fL/test/images"
+  test_label_dir: "/home/c/yuqyan/data/TreeAI/12_RGB_SemSegm_640_fL/test/labels"
 
 # Wandb configuration (for experiment tracking)
 wandb:

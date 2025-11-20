@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
                         help='Path to training manifest JSONL file')
     parser.add_argument('--val-manifest', type=str, default=None,
                         help='Path to validation manifest JSONL file')
+    parser.add_argument('--test-manifest', type=str, default=None,
+                        help='Path to test manifest JSONL file')
     parser.add_argument('--output-root', type=str, default=None,
                         help='Root directory for instance data (contains mask files)')
     parser.add_argument('--num-classes', type=int, default=None,
@@ -114,6 +116,16 @@ def parse_args() -> argparse.Namespace:
                         help='Path to pick dataset for visualization')
     parser.add_argument('--classes-yaml', type=str, default=None,
                         help='Path to treeAI_classes.yaml')
+    
+    # Test arguments
+    parser.add_argument('--auto-test-on-finish', dest='auto_test_on_finish', action='store_true', default=None,
+                        help='Automatically test on test set when training finishes')
+    parser.add_argument('--no-auto-test-on-finish', dest='auto_test_on_finish', action='store_false',
+                        help='Disable automatic testing on finish')
+    parser.add_argument('--test-image-dir', type=str, default=None,
+                        help='Directory containing test images')
+    parser.add_argument('--test-label-dir', type=str, default=None,
+                        help='Directory containing test labels')
     
     # Wandb arguments
     parser.add_argument('--use-wandb', dest='use_wandb', action='store_true', default=None,
@@ -420,6 +432,221 @@ def validate(
     }
 
 
+@torch.no_grad()
+def test_on_test_set(
+    checkpoint_path: Path,
+    test_manifest: str,
+    output_root: str,
+    test_image_dir: str,
+    test_label_dir: str,
+    classes_yaml: str,
+    output_dir: Path,
+    device: torch.device,
+    num_viz_samples: int = 20,
+):
+    """Test trained model on actual test set."""
+    print("\n" + "=" * 80)
+    print("Testing on True Test Set")
+    print("=" * 80)
+    
+    # Load checkpoint
+    print(f"\nLoading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_args = checkpoint['args']
+    
+    # Load class information
+    class_names, class_colors, class_groups = load_treeai_classes(classes_yaml)
+    
+    # Create model
+    model = create_instance_classifier(
+        num_classes=checkpoint_args['num_classes'],
+        model_type=checkpoint_args['model_type'],
+        encoder_name=checkpoint_args['encoder'],
+        pretrained=False,
+        dropout=checkpoint_args['dropout'],
+        use_mask_features=checkpoint_args.get('use_mask_features', False),
+    )
+    model.load_state_dict(checkpoint['model'])
+    model = model.to(device)
+    model.eval()
+    
+    # Load test instances
+    print(f"\nLoading test instances from: {test_manifest}")
+    instances_by_image = {}
+    with open(test_manifest, 'r') as f:
+        for line in f:
+            if line.strip():
+                inst = json.loads(line)
+                image_name = inst['image']
+                if image_name not in instances_by_image:
+                    instances_by_image[image_name] = []
+                instances_by_image[image_name].append(inst)
+    
+    print(f"Found {len(instances_by_image)} test images")
+    total_instances = sum(len(insts) for insts in instances_by_image.values())
+    print(f"Total instances: {total_instances}")
+    
+    # Setup transform
+    import torchvision.transforms as transforms
+    image_size = checkpoint_args.get('image_size', [224, 224])
+    transform = transforms.Compose([
+        transforms.Resize(tuple(image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    # Process all test images
+    print("\nProcessing test images...")
+    all_images = []
+    all_gt_masks = []
+    all_pred_masks = []
+    all_bboxes = []
+    
+    test_image_dir = Path(test_image_dir)
+    test_label_dir = Path(test_label_dir)
+    
+    for image_name in tqdm(sorted(instances_by_image.keys()), desc='Predicting'):
+        # Find image and label files
+        image_files = list(test_image_dir.glob(f"{image_name}.*"))
+        label_files = list(test_label_dir.glob(f"{image_name}.*"))
+        
+        if not image_files or not label_files:
+            continue
+        
+        image_path = image_files[0]
+        label_path = label_files[0]
+        
+        # Load GT
+        gt_mask = np.array(Image.open(label_path)).astype(np.int32)
+        
+        # Predict instances
+        image_rgb, predictions, scores, masks, bboxes = predict_instances_for_image(
+            model=model,
+            image_path=str(image_path),
+            manifest_instances=instances_by_image[image_name],
+            output_root=Path(output_root),
+            transform=transform,
+            device=device,
+            model_type=checkpoint_args['model_type'],
+        )
+        
+        # Convert to semantic map
+        pred_mask = instances_to_semantic_map(
+            image_shape=gt_mask.shape,
+            instance_masks=masks,
+            instance_labels=predictions,
+            instance_scores=scores,
+        )
+        
+        all_images.append(image_rgb)
+        all_gt_masks.append(gt_mask)
+        all_pred_masks.append(pred_mask)
+        all_bboxes.append(bboxes)
+    
+    print(f"\nProcessed {len(all_images)} images")
+    
+    # Compute pixel-level metrics
+    print("\nComputing metrics...")
+    y_true = np.concatenate([mask.flatten() for mask in all_gt_masks])
+    y_pred = np.concatenate([mask.flatten() for mask in all_pred_masks])
+    
+    # Overall accuracy
+    valid_mask = y_true != 0  # Exclude background
+    if valid_mask.sum() > 0:
+        accuracy = (y_true[valid_mask] == y_pred[valid_mask]).mean()
+    else:
+        accuracy = 0.0
+    
+    print(f"Overall Pixel Accuracy (excluding background): {accuracy:.4f}")
+    
+    # Group F1 scores
+    print("\nComputing group F1 scores...")
+    group_f1 = compute_group_f1_scores(y_true, y_pred, class_groups)
+    
+    print("\n📊 Group F1 Scores:")
+    for group_name, f1 in group_f1.items():
+        print(f"  {group_name:20s}: {f1:.4f}")
+    
+    # Save results
+    results = {
+        'checkpoint': str(checkpoint_path),
+        'num_test_images': len(all_images),
+        'num_instances': total_instances,
+        'pixel_accuracy': float(accuracy),
+        'group_f1_scores': {k: float(v) for k, v in group_f1.items()},
+    }
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / 'test_results.json').open('w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\n✅ Results saved to: {output_dir / 'test_results.json'}")
+    
+    # Generate confusion matrices
+    print("\nGenerating confusion matrices...")
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        output_dir / 'confusion.jpg',
+        normalize=None,
+        title='Test Set Confusion Matrix (Counts)'
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        output_dir / 'confusion_norm_true.jpg',
+        normalize='true',
+        title='Test Set Confusion Matrix (Normalized by True)'
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        output_dir / 'confusion_norm_pred.jpg',
+        normalize='pred',
+        title='Test Set Confusion Matrix (Normalized by Pred)'
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        output_dir / 'confusion_norm_all.jpg',
+        normalize='all',
+        title='Test Set Confusion Matrix (Normalized All)'
+    )
+    
+    # Generate visualizations
+    if len(all_images) > 0:
+        print("\nGenerating visualizations...")
+        num_viz = min(num_viz_samples, len(all_images))
+        
+        # First N samples
+        visualize_instance_predictions(
+            images=all_images[:num_viz],
+            gt_masks=all_gt_masks[:num_viz],
+            pred_masks=all_pred_masks[:num_viz],
+            bboxes_list=all_bboxes[:num_viz],
+            class_names=class_names,
+            class_colors=class_colors,
+            num_samples=min(10, num_viz),
+            which='first',
+            save_path=output_dir / 'qualitative_first.jpg',
+        )
+        
+        # Last N samples
+        if len(all_images) > num_viz:
+            visualize_instance_predictions(
+                images=all_images[-num_viz:],
+                gt_masks=all_gt_masks[-num_viz:],
+                pred_masks=all_pred_masks[-num_viz:],
+                bboxes_list=all_bboxes[-num_viz:],
+                class_names=class_names,
+                class_colors=class_colors,
+                num_samples=min(10, num_viz),
+                which='last',
+                save_path=output_dir / 'qualitative_last.jpg',
+            )
+    
+    print("\n" + "=" * 80)
+    print("Testing complete!")
+    print(f"Results saved to: {output_dir}")
+    print("=" * 80)
+
+
 DEFAULT_ARGS = {
     'model_type': 'simple',
     'encoder': 'resnet50',
@@ -439,6 +666,7 @@ DEFAULT_ARGS = {
     'viz_freq': 0,
     'use_wandb': False,
     'device': 'cuda',
+    'auto_test_on_finish': True,
 }
 
 
@@ -485,6 +713,7 @@ def load_config_and_merge_args(args: argparse.Namespace) -> argparse.Namespace:
     # Dataset config
     set_if_none('train_manifest', 'dataset.train_manifest')
     set_if_none('val_manifest', 'dataset.val_manifest')
+    set_if_none('test_manifest', 'dataset.test_manifest')
     set_if_none('output_root', 'dataset.output_root')
     set_if_none('num_classes', 'dataset.num_classes')
     set_if_none('classes_yaml', 'dataset.classes_yaml')
@@ -529,6 +758,12 @@ def load_config_and_merge_args(args: argparse.Namespace) -> argparse.Namespace:
     
     # Device
     set_if_none('device', 'device')
+    
+    # Test config
+    if args.auto_test_on_finish is None:
+        args.auto_test_on_finish = config.get('testing', {}).get('auto_test_on_finish', True)
+    set_if_none('test_image_dir', 'testing.test_image_dir')
+    set_if_none('test_label_dir', 'testing.test_label_dir')
     
     return _apply_default_args(args)
 
@@ -740,6 +975,42 @@ def main():
     print("Training complete!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
     print("=" * 80)
+    
+    # Test on test set
+    if args.auto_test_on_finish and args.test_manifest:
+        print("\n🧪 Auto-testing on test set...")
+        
+        # Infer test image/label directories if not provided
+        if not args.test_image_dir or not args.test_label_dir:
+            # Try to infer from pick_root pattern
+            if args.pick_root:
+                # /path/to/12_RGB_SemSegm_640_fL/pick -> /path/to/12_RGB_SemSegm_640_fL/test
+                test_root = Path(args.pick_root).parent / 'test'
+                args.test_image_dir = args.test_image_dir or str(test_root / 'images')
+                args.test_label_dir = args.test_label_dir or str(test_root / 'labels')
+            else:
+                print("⚠️  Test image/label directories not specified, skipping test.")
+                args.auto_test_on_finish = False
+        
+        if args.auto_test_on_finish:
+            try:
+                test_on_test_set(
+                    checkpoint_path=output_dir / 'best_model.pt',
+                    test_manifest=args.test_manifest,
+                    output_root=args.output_root,
+                    test_image_dir=args.test_image_dir,
+                    test_label_dir=args.test_label_dir,
+                    classes_yaml=args.classes_yaml,
+                    output_dir=output_dir / 'test_results',
+                    device=device,
+                    num_viz_samples=20,
+                )
+            except Exception as e:
+                print(f"❌ Test failed: {e}")
+                import traceback
+                traceback.print_exc()
+    elif args.auto_test_on_finish and not args.test_manifest:
+        print("⚠️  Auto-test enabled but test_manifest not specified, skipping test.")
     
     # Close wandb
     if args.use_wandb:

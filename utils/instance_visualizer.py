@@ -377,10 +377,13 @@ def plot_confusion_matrix_semantic(
     # Normalize if requested
     if normalize == 'true':
         cm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
+        cm = cm * 100  # Convert to percentage
     elif normalize == 'pred':
         cm = cm.astype('float') / (cm.sum(axis=0, keepdims=True) + 1e-8)
+        cm = cm * 100  # Convert to percentage
     elif normalize == 'all':
         cm = cm.astype('float') / (cm.sum() + 1e-8)
+        cm = cm * 100  # Convert to percentage
     
     # Plot
     fig, ax = plt.subplots(figsize=(20, 18))
@@ -401,7 +404,7 @@ def plot_confusion_matrix_semantic(
     plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
     
     # Annotate cells
-    fmt = '.2f' if normalize else 'd'
+    fmt = '.0f' if normalize else 'd'  # Use integer format for percentage
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
