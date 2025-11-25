@@ -169,6 +169,7 @@ backup/
 *.backup
 *~
 rsprompter_prompts/
+rsprompter_prompts_backup/
 sam2_instances/
 # System files
 .DS_Store

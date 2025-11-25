@@ -19,9 +19,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-import torchvision.transforms as transforms
-from PIL import Image
-from tqdm import tqdm
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -30,12 +28,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.instance_classifier import create_instance_classifier
 from utils.instance_visualizer import (
     load_treeai_classes,
-    instances_to_semantic_map,
-    predict_instances_for_image,
     visualize_instance_predictions,
     plot_confusion_matrix_semantic,
-    compute_group_f1_scores,
 )
+from utils.instance_evaluation import evaluate_instance_segmentation
 
 
 def parse_args():
@@ -120,105 +116,81 @@ def main():
                 instances_by_image[image_name].append(inst)
     
     print(f"Found {len(instances_by_image)} test images")
-    total_instances = sum(len(insts) for insts in instances_by_image.values())
-    print(f"Total instances: {total_instances}")
     
-    # Setup transform
+    # Run evaluation
     image_size = checkpoint_args.get('image_size', [224, 224])
-    transform = transforms.Compose([
-        transforms.Resize(tuple(image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    excluded_classes = checkpoint_args.get('excluded_classes', None)
     
-    # Process all test images
-    print("\nProcessing test images...")
-    all_images = []
-    all_gt_masks = []
-    all_pred_masks = []
-    all_bboxes = []
-    all_image_names = []
+    results = evaluate_instance_segmentation(
+        model=model,
+        instances_by_image=instances_by_image,
+        image_dir=Path(args.test_image_dir),
+        label_dir=Path(args.test_label_dir),
+        output_root=Path(args.output_root),
+        class_names=class_names,
+        class_groups=class_groups,
+        device=device,
+        model_type=checkpoint_args['model_type'],
+        image_size=tuple(image_size),
+        desc="Predicting",
+        excluded_classes=excluded_classes,
+    )
     
-    test_image_dir = Path(args.test_image_dir)
-    test_label_dir = Path(args.test_label_dir)
+    if not results:
+        print("Evaluation failed or returned no results.")
+        return
+
+    # Extract arrays
+    y_true = results.pop('y_true')
+    y_pred = results.pop('y_pred')
+    all_images = results.pop('all_images')
+    all_gt_masks = results.pop('all_gt_masks')
+    all_pred_masks = results.pop('all_pred_masks')
+    all_bboxes = results.pop('all_bboxes')
     
-    for image_name in tqdm(sorted(instances_by_image.keys()), desc='Predicting'):
-        # Find image and label files
-        image_files = list(test_image_dir.glob(f"{image_name}.*"))
-        label_files = list(test_label_dir.glob(f"{image_name}.*"))
-        
-        if not image_files or not label_files:
-            continue
-        
-        image_path = image_files[0]
-        label_path = label_files[0]
-        
-        # Load GT
-        gt_mask = np.array(Image.open(label_path)).astype(np.int32)
-        
-        # Predict instances
-        image_rgb, predictions, scores, masks, bboxes = predict_instances_for_image(
-            model=model,
-            image_path=str(image_path),
-            manifest_instances=instances_by_image[image_name],
-            output_root=Path(args.output_root),
-            transform=transform,
-            device=device,
-            model_type=checkpoint_args['model_type'],
-        )
-        
-        # Convert to semantic map
-        pred_mask = instances_to_semantic_map(
-            image_shape=gt_mask.shape,
-            instance_masks=masks,
-            instance_labels=predictions,
-            instance_scores=scores,
-        )
-        
-        all_images.append(image_rgb)
-        all_gt_masks.append(gt_mask)
-        all_pred_masks.append(pred_mask)
-        all_bboxes.append(bboxes)
-        all_image_names.append(image_name)
+    # Add checkpoint info
+    results['checkpoint'] = str(args.checkpoint)
     
-    print(f"\nProcessed {len(all_images)} images")
+    # Print Metrics
+    print(f"\n📊 Overall Metrics (macro average across {len(results['per_class_metrics'])} classes):")
+    print(f"  F1-avg (with bg):    {results['F1-avg']:.4f}")
+    print(f"  F1-avg-wo0 (no bg):  {results['F1-avg-wo0']:.4f}")
+    print(f"  Mean Precision:      {results['mean_precision']:.4f}")
+    print(f"  Mean Recall:         {results['mean_recall']:.4f}")
+    print(f"  Mean IoU (mIoU):     {results['mean_iou']:.4f}")
     
-    # Compute pixel-level metrics
-    print("\nComputing metrics...")
-    y_true = np.concatenate([mask.flatten() for mask in all_gt_masks])
-    y_pred = np.concatenate([mask.flatten() for mask in all_pred_masks])
+    if results['species_only_f1'] > 0:
+        print(f"\n🌲 Species-Only Metrics ({results['num_species_classes']} species):")
+        print(f"  Mean F1 Score:    {results['species_only_f1']:.4f}")
+        print(f"  Mean Precision:   {results['species_only_precision']:.4f}")
+        print(f"  Mean Recall:      {results['species_only_recall']:.4f}")
+        print(f"  Mean IoU (mIoU):  {results['species_only_iou']:.4f}")
+
+    # Per-class metrics summary
+    print(f"\n📋 Per-Class Metrics:")
+    print(f"{'Class ID':<10} {'Name':<30} {'F1':<8} {'Precision':<10} {'Recall':<8} {'IoU':<8}")
+    print("-" * 90)
+    for cls_id, metrics in sorted(results['per_class_metrics'].items()):
+        print(f"{cls_id:<10} {metrics['name']:<30} {metrics['f1']:<8.4f} {metrics['precision']:<10.4f} {metrics['recall']:<8.4f} {metrics['iou']:<8.4f}")
     
-    # Overall accuracy
-    valid_mask = y_true != 0  # Exclude background
-    if valid_mask.sum() > 0:
-        accuracy = (y_true[valid_mask] == y_pred[valid_mask]).mean()
-    else:
-        accuracy = 0.0
-    
-    print(f"Overall Pixel Accuracy (excluding background): {accuracy:.4f}")
-    
-    # Group F1 scores
-    print("\nComputing group F1 scores...")
-    group_f1 = compute_group_f1_scores(y_true, y_pred, class_groups)
-    
+    # Group F1 Scores
     print("\n📊 Group F1 Scores:")
-    for group_name, f1 in group_f1.items():
+    for group_name, f1 in results['group_f1_scores'].items():
         print(f"  {group_name:20s}: {f1:.4f}")
-    
+
     # Save results
-    results = {
-        'checkpoint': str(args.checkpoint),
-        'num_test_images': len(all_images),
-        'num_instances': total_instances,
-        'pixel_accuracy': float(accuracy),
-        'group_f1_scores': {k: float(v) for k, v in group_f1.items()},
-    }
-    
     with (output_dir / 'test_results.json').open('w') as f:
         json.dump(results, f, indent=2)
     
     print(f"\n✅ Results saved to: {output_dir / 'test_results.json'}")
     
+    # Save prediction arrays
+    print(f"\n💾 Saving prediction arrays for evaluation comparison...")
+    np.save(output_dir / 'y_true.npy', y_true)
+    np.save(output_dir / 'y_pred.npy', y_pred)
+    print(f"   Saved y_true.npy ({y_true.shape})")
+    print(f"   Saved y_pred.npy ({y_pred.shape})")
+
     # Generate confusion matrices
     print("\nGenerating confusion matrices...")
     plot_confusion_matrix_semantic(
@@ -226,6 +198,13 @@ def main():
         output_dir / 'confusion.jpg',
         normalize=None,
         title='Test Set Confusion Matrix (Counts)'
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        output_dir / 'confusion_with_bg.jpg',
+        normalize='true',  # 0-100 percentage normalized by true labels
+        title='Test Set Confusion Matrix (with Background)',
+        include_background=True
     )
     plot_confusion_matrix_semantic(
         y_true, y_pred, class_names,
@@ -251,7 +230,6 @@ def main():
         print("\nGenerating visualizations...")
         num_viz = min(args.num_viz_samples, len(all_images))
         
-        # First N samples
         visualize_instance_predictions(
             images=all_images[:num_viz],
             gt_masks=all_gt_masks[:num_viz],
@@ -264,7 +242,6 @@ def main():
             save_path=output_dir / 'qualitative_first.jpg',
         )
         
-        # Last N samples
         if len(all_images) > num_viz:
             visualize_instance_predictions(
                 images=all_images[-num_viz:],
@@ -286,4 +263,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

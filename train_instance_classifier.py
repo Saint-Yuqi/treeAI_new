@@ -43,6 +43,7 @@ from utils.instance_visualizer import (
     plot_confusion_matrix_semantic,
     compute_group_f1_scores,
 )
+from utils.instance_evaluation import evaluate_instance_segmentation
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +127,12 @@ def parse_args() -> argparse.Namespace:
                         help='Directory containing test images')
     parser.add_argument('--test-label-dir', type=str, default=None,
                         help='Directory containing test labels')
+    
+    # Full Validation arguments
+    parser.add_argument('--val-image-dir', type=str, default=None,
+                        help='Directory containing validation images (for full evaluation)')
+    parser.add_argument('--val-label-dir', type=str, default=None,
+                        help='Directory containing validation labels (for full evaluation)')
     
     # Wandb arguments
     parser.add_argument('--use-wandb', dest='use_wandb', action='store_true', default=None,
@@ -338,7 +345,15 @@ def generate_visualizations(
     )
     
     # Compute group F1 scores
-    group_f1 = compute_group_f1_scores(y_true, y_pred, class_groups)
+    # Exclude order/genus level classes from group F1 calculation
+    non_species_classes = [
+        37, 60,  # order level (coniferous, deciduous)
+        5, 11, 43, 50, 56, 58, 59, 61,  # genus level (betula sp., picea sp., etc.)
+    ]
+    group_f1 = compute_group_f1_scores(
+        y_true, y_pred, class_groups, 
+        ignore_classes=non_species_classes
+    )
     
     print("\n📊 Group F1 Scores (pick dataset):")
     for group_name, f1 in group_f1.items():
@@ -432,6 +447,97 @@ def validate(
     }
 
 
+def validate_full_segmentation(
+    model: nn.Module,
+    instances_by_image: Dict[str, List[Dict]],
+    image_dir: Path,
+    label_dir: Path,
+    output_root: Path,
+    class_names: Dict[int, str],
+    class_groups: Dict[str, List[int]],
+    device: torch.device,
+    model_type: str,
+    image_size: Tuple[int, int],
+    epoch: int,
+    output_dir: Path,
+    use_wandb: bool = False,
+    excluded_classes: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    """Run full semantic segmentation validation (matches test protocol)."""
+    print(f"\n🧪 Running Full Image Validation (Epoch {epoch + 1})...")
+    
+    # Create epoch output directory
+    val_out_dir = output_dir / f'val_epoch_{epoch + 1}'
+    val_out_dir.mkdir(parents=True, exist_ok=True)
+    
+    results = evaluate_instance_segmentation(
+        model=model,
+        instances_by_image=instances_by_image,
+        image_dir=image_dir,
+        label_dir=label_dir,
+        output_root=output_root,
+        class_names=class_names,
+        class_groups=class_groups,
+        device=device,
+        model_type=model_type,
+        image_size=image_size,
+        max_samples=None, # Validate on all available validation images
+        desc=f"Val Epoch {epoch+1}",
+        excluded_classes=excluded_classes,
+    )
+    
+    if not results:
+        return {}
+
+    # Extract arrays for visualization/confusion matrix but don't keep them in memory if not needed
+    y_true = results.pop('y_true')
+    y_pred = results.pop('y_pred')
+    all_images = results.pop('all_images')
+    all_gt_masks = results.pop('all_gt_masks')
+    all_pred_masks = results.pop('all_pred_masks')
+    all_bboxes = results.pop('all_bboxes')
+    
+    # Save metrics
+    with (val_out_dir / 'val_results.json').open('w') as f:
+        json.dump(results, f, indent=2)
+        
+    # Generate confusion matrix
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        val_out_dir / 'confusion_norm_true.jpg',
+        normalize='true',
+        title=f'Val Epoch {epoch+1} Confusion Matrix'
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
+        val_out_dir / 'confusion_with_bg.jpg',
+        normalize='true',  # 0-100 percentage normalized by true labels
+        title=f'Val Epoch {epoch+1} Confusion Matrix (with Background)',
+        include_background=True
+    )
+    
+    # Log metrics to wandb
+    if use_wandb:
+        import wandb
+        log_dict = {
+            'val_full/F1-avg': results['F1-avg'],
+            'val_full/F1-avg-wo0': results['F1-avg-wo0'],
+            'val_full/mean_iou': results['mean_iou'],
+            'val_full/pixel_accuracy': results['pixel_accuracy_incl_bg'],
+            'val_full/species_only_f1': results['species_only_f1'],
+            'val_full/species_only_iou': results['species_only_iou'],
+        }
+        # Add group F1s
+        for k, v in results['group_f1_scores'].items():
+            log_dict[f'val_full/group_f1/{k}'] = v
+            
+        wandb.log(log_dict, step=epoch+1)
+        
+    print(f"  F1-avg: {results['F1-avg']:.4f} | F1-avg-wo0: {results['F1-avg-wo0']:.4f} | mIoU: {results['mean_iou']:.4f} | Species F1: {results['species_only_f1']:.4f}")
+    
+    return results
+
+
 @torch.no_grad()
 def test_on_test_set(
     checkpoint_path: Path,
@@ -444,7 +550,7 @@ def test_on_test_set(
     device: torch.device,
     num_viz_samples: int = 20,
 ):
-    """Test trained model on actual test set."""
+    """Test trained model on actual test set using full evaluation."""
     print("\n" + "=" * 80)
     print("Testing on True Test Set")
     print("=" * 80)
@@ -467,7 +573,7 @@ def test_on_test_set(
         use_mask_features=checkpoint_args.get('use_mask_features', False),
     )
     model.load_state_dict(checkpoint['model'])
-    model = model.to(device)
+    model.to(device)
     model.eval()
     
     # Load test instances
@@ -482,104 +588,57 @@ def test_on_test_set(
                     instances_by_image[image_name] = []
                 instances_by_image[image_name].append(inst)
     
-    print(f"Found {len(instances_by_image)} test images")
-    total_instances = sum(len(insts) for insts in instances_by_image.values())
-    print(f"Total instances: {total_instances}")
-    
-    # Setup transform
-    import torchvision.transforms as transforms
-    image_size = checkpoint_args.get('image_size', [224, 224])
-    transform = transforms.Compose([
-        transforms.Resize(tuple(image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    
-    # Process all test images
-    print("\nProcessing test images...")
-    all_images = []
-    all_gt_masks = []
-    all_pred_masks = []
-    all_bboxes = []
-    
-    test_image_dir = Path(test_image_dir)
-    test_label_dir = Path(test_label_dir)
-    
-    for image_name in tqdm(sorted(instances_by_image.keys()), desc='Predicting'):
-        # Find image and label files
-        image_files = list(test_image_dir.glob(f"{image_name}.*"))
-        label_files = list(test_label_dir.glob(f"{image_name}.*"))
-        
-        if not image_files or not label_files:
-            continue
-        
-        image_path = image_files[0]
-        label_path = label_files[0]
-        
-        # Load GT
-        gt_mask = np.array(Image.open(label_path)).astype(np.int32)
-        
-        # Predict instances
-        image_rgb, predictions, scores, masks, bboxes = predict_instances_for_image(
-            model=model,
-            image_path=str(image_path),
-            manifest_instances=instances_by_image[image_name],
-            output_root=Path(output_root),
-            transform=transform,
-            device=device,
-            model_type=checkpoint_args['model_type'],
-        )
-        
-        # Convert to semantic map
-        pred_mask = instances_to_semantic_map(
-            image_shape=gt_mask.shape,
-            instance_masks=masks,
-            instance_labels=predictions,
-            instance_scores=scores,
-        )
-        
-        all_images.append(image_rgb)
-        all_gt_masks.append(gt_mask)
-        all_pred_masks.append(pred_mask)
-        all_bboxes.append(bboxes)
-    
-    print(f"\nProcessed {len(all_images)} images")
-    
-    # Compute pixel-level metrics
-    print("\nComputing metrics...")
-    y_true = np.concatenate([mask.flatten() for mask in all_gt_masks])
-    y_pred = np.concatenate([mask.flatten() for mask in all_pred_masks])
-    
-    # Overall accuracy
-    valid_mask = y_true != 0  # Exclude background
-    if valid_mask.sum() > 0:
-        accuracy = (y_true[valid_mask] == y_pred[valid_mask]).mean()
-    else:
-        accuracy = 0.0
-    
-    print(f"Overall Pixel Accuracy (excluding background): {accuracy:.4f}")
-    
-    # Group F1 scores
-    print("\nComputing group F1 scores...")
-    group_f1 = compute_group_f1_scores(y_true, y_pred, class_groups)
-    
-    print("\n📊 Group F1 Scores:")
-    for group_name, f1 in group_f1.items():
-        print(f"  {group_name:20s}: {f1:.4f}")
-    
-    # Save results
-    results = {
-        'checkpoint': str(checkpoint_path),
-        'num_test_images': len(all_images),
-        'num_instances': total_instances,
-        'pixel_accuracy': float(accuracy),
-        'group_f1_scores': {k: float(v) for k, v in group_f1.items()},
-    }
-    
+    # Run evaluation
     output_dir.mkdir(parents=True, exist_ok=True)
+    image_size = checkpoint_args.get('image_size', [224, 224])
+    excluded_classes = checkpoint_args.get('excluded_classes', None)
+    
+    results = evaluate_instance_segmentation(
+        model=model,
+        instances_by_image=instances_by_image,
+        image_dir=Path(test_image_dir),
+        label_dir=Path(test_label_dir),
+        output_root=Path(output_root),
+        class_names=class_names,
+        class_groups=class_groups,
+        device=device,
+        model_type=checkpoint_args['model_type'],
+        image_size=tuple(image_size),
+        desc="Testing",
+        excluded_classes=excluded_classes,
+    )
+    
+    if not results:
+        print("Evaluation failed or returned no results.")
+        return
+
+    # Extract arrays for visualization
+    y_true = results.pop('y_true')
+    y_pred = results.pop('y_pred')
+    all_images = results.pop('all_images')
+    all_gt_masks = results.pop('all_gt_masks')
+    all_pred_masks = results.pop('all_pred_masks')
+    all_bboxes = results.pop('all_bboxes')
+    
+    # Add checkpoint info to results
+    results['checkpoint'] = str(checkpoint_path)
+    
+    # Print Summary
+    print(f"\n📊 Overall Metrics:")
+    print(f"  F1-avg (with bg):    {results['F1-avg']:.4f}")
+    print(f"  F1-avg-wo0 (no bg):  {results['F1-avg-wo0']:.4f}")
+    print(f"  Mean Precision:      {results['mean_precision']:.4f}")
+    print(f"  Mean Recall:         {results['mean_recall']:.4f}")
+    print(f"  Mean IoU (mIoU):     {results['mean_iou']:.4f}")
+    
+    if results['species_only_f1'] > 0:
+        print(f"\n🌲 Species-Only Metrics ({results['num_species_classes']} species):")
+        print(f"  Mean F1 Score:    {results['species_only_f1']:.4f}")
+        print(f"  Mean IoU (mIoU):  {results['species_only_iou']:.4f}")
+
+    # Save results
     with (output_dir / 'test_results.json').open('w') as f:
         json.dump(results, f, indent=2)
-    
     print(f"\n✅ Results saved to: {output_dir / 'test_results.json'}")
     
     # Generate confusion matrices
@@ -592,21 +651,16 @@ def test_on_test_set(
     )
     plot_confusion_matrix_semantic(
         y_true, y_pred, class_names,
+        output_dir / 'confusion_with_bg.jpg',
+        normalize='true',  # 0-100 percentage normalized by true labels
+        title='Test Set Confusion Matrix (with Background)',
+        include_background=True
+    )
+    plot_confusion_matrix_semantic(
+        y_true, y_pred, class_names,
         output_dir / 'confusion_norm_true.jpg',
         normalize='true',
         title='Test Set Confusion Matrix (Normalized by True)'
-    )
-    plot_confusion_matrix_semantic(
-        y_true, y_pred, class_names,
-        output_dir / 'confusion_norm_pred.jpg',
-        normalize='pred',
-        title='Test Set Confusion Matrix (Normalized by Pred)'
-    )
-    plot_confusion_matrix_semantic(
-        y_true, y_pred, class_names,
-        output_dir / 'confusion_norm_all.jpg',
-        normalize='all',
-        title='Test Set Confusion Matrix (Normalized All)'
     )
     
     # Generate visualizations
@@ -727,6 +781,11 @@ def load_config_and_merge_args(args: argparse.Namespace) -> argparse.Namespace:
         image_size = config.get('dataset', {}).get('image_size', [224, 224])
         args.image_size = image_size if isinstance(image_size, list) else [image_size, image_size]
     
+    # Handle excluded_classes (special case: list)
+    if not hasattr(args, 'excluded_classes') or args.excluded_classes is None:
+        excluded_classes = config.get('dataset', {}).get('excluded_classes', None)
+        args.excluded_classes = excluded_classes
+    
     # Model config
     set_if_none('model_type', 'model.model_type')
     set_if_none('encoder', 'model.encoder')
@@ -764,6 +823,8 @@ def load_config_and_merge_args(args: argparse.Namespace) -> argparse.Namespace:
         args.auto_test_on_finish = config.get('testing', {}).get('auto_test_on_finish', True)
     set_if_none('test_image_dir', 'testing.test_image_dir')
     set_if_none('test_label_dir', 'testing.test_label_dir')
+    set_if_none('val_image_dir', 'validation.val_image_dir')
+    set_if_none('val_label_dir', 'validation.val_label_dir')
     
     return _apply_default_args(args)
 
@@ -814,6 +875,43 @@ def main():
         )
         print("✅ Wandb initialized")
     
+    # Prepare full validation data
+    val_instances_by_image = {}
+    do_full_validation = False
+    
+    # Infer validation directories if not provided
+    if not args.val_image_dir or not args.val_label_dir:
+        # Try to infer from pick_root or output_root
+        if args.pick_root:
+            # Typical structure: .../dataset_name/pick -> .../dataset_name/val
+            val_root = Path(args.pick_root).parent / 'val'
+            if (val_root / 'images').exists() and (val_root / 'labels').exists():
+                args.val_image_dir = args.val_image_dir or str(val_root / 'images')
+                args.val_label_dir = args.val_label_dir or str(val_root / 'labels')
+                print(f"Inferred validation dirs: {args.val_image_dir}, {args.val_label_dir}")
+        elif args.output_root:
+            # Try output_root (dataset root)
+             val_root = Path(args.output_root) / 'val'
+             if (val_root / 'images').exists() and (val_root / 'labels').exists():
+                args.val_image_dir = args.val_image_dir or str(val_root / 'images')
+                args.val_label_dir = args.val_label_dir or str(val_root / 'labels')
+                print(f"Inferred validation dirs from output_root: {args.val_image_dir}, {args.val_label_dir}")
+
+    if args.val_image_dir and args.val_label_dir and Path(args.val_image_dir).exists() and Path(args.val_label_dir).exists():
+        print(f"\nLoading validation instances for full evaluation from {args.val_manifest}...")
+        with open(args.val_manifest, 'r') as f:
+            for line in f:
+                if line.strip():
+                    inst = json.loads(line)
+                    image_name = inst['image']
+                    if image_name not in val_instances_by_image:
+                        val_instances_by_image[image_name] = []
+                    val_instances_by_image[image_name].append(inst)
+        print(f"Loaded {len(val_instances_by_image)} validation images for full evaluation")
+        do_full_validation = True
+    else:
+        print("\n⚠️  Full validation disabled (missing val_image_dir/val_label_dir)")
+
     # Create dataloaders
     print("\nCreating dataloaders...")
     train_loader, val_loader = create_instance_dataloaders(
@@ -825,6 +923,7 @@ def main():
         min_purity=args.min_purity,
         min_area=args.min_area,
         image_size=tuple(args.image_size),
+        excluded_classes=getattr(args, 'excluded_classes', None),
     )
     
     # Create model
@@ -928,35 +1027,52 @@ def main():
                 image_size=tuple(args.image_size),
                 use_wandb=args.use_wandb,
             )
+
+        # Run Full Validation (matches test set protocol)
+        if do_full_validation and args.viz_freq > 0 and (epoch + 1) % args.viz_freq == 0:
+             validate_full_segmentation(
+                model=model,
+                instances_by_image=val_instances_by_image,
+                image_dir=Path(args.val_image_dir),
+                label_dir=Path(args.val_label_dir),
+                output_root=Path(args.output_root),
+                class_names=class_names,
+                class_groups=class_groups,
+                device=device,
+                model_type=args.model_type,
+                image_size=tuple(args.image_size),
+                epoch=epoch,
+                output_dir=output_dir,
+                use_wandb=args.use_wandb,
+                excluded_classes=getattr(args, 'excluded_classes', None),
+            )
         
         # Save checkpoint
         is_best = val_metrics['accuracy'] > best_val_acc
         if is_best:
             best_val_acc = val_metrics['accuracy']
         
-        if (epoch + 1) % args.save_freq == 0 or is_best:
-            checkpoint = {
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'train_metrics': train_metrics,
-                'val_metrics': val_metrics,
-                'best_val_acc': best_val_acc,
-                'args': vars(args),
-            }
-            
-            # Save regular checkpoint
-            if (epoch + 1) % args.save_freq == 0:
-                checkpoint_path = output_dir / f'checkpoint_epoch_{epoch + 1}.pt'
-                torch.save(checkpoint, checkpoint_path)
-                print(f"Saved checkpoint: {checkpoint_path}")
-            
-            # Save best model
-            if is_best:
-                best_path = output_dir / 'best_model.pt'
-                torch.save(checkpoint, best_path)
-                print(f"Saved best model: {best_path} (acc: {best_val_acc:.4f})")
+        # Always prepare checkpoint dict (for best/final/last)
+        checkpoint = {
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'train_metrics': train_metrics,
+            'val_metrics': val_metrics,
+            'best_val_acc': best_val_acc,
+            'args': vars(args),
+        }
+        
+        # Save best model (automatically when validation accuracy improves)
+        if is_best:
+            best_path = output_dir / 'best_model.pt'
+            torch.save(checkpoint, best_path)
+            print(f"Saved best model: {best_path} (acc: {best_val_acc:.4f})")
+        
+        # Save last checkpoint (for resume capability, overwrites previous)
+        last_path = output_dir / 'last_checkpoint.pt'
+        torch.save(checkpoint, last_path)
     
     # Save final model
     final_checkpoint = {

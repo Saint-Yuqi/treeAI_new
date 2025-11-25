@@ -18,6 +18,12 @@ dataset:
   # Labels in data: 1-61 → converted to 0-60 in code → num_classes=61
   num_classes: 61
   
+  # Classes to exclude from F1-avg and F1-avg-wo0 calculation
+  # These are order/genus level classes that should not be counted as species
+  excluded_classes: [37, 60, 5, 11, 43, 50, 56, 58, 59, 61]
+  # 37, 60: order level (coniferous, deciduous)
+  # 5, 11, 43, 50, 56, 58, 59, 61: genus level (betula sp., picea sp., acer sp., etc.)
+  
   # Data filtering
   min_purity: 0.7      # Minimum purity threshold (0.7 = 70% label agreement)
   min_area: 100        # Minimum mask area in pixels
@@ -48,7 +54,7 @@ model:
 # Training configuration
 training:
   # Number of epochs
-  epochs: 1
+  epochs: 200
   
   # Learning rate
   lr: 1.0e-4

@@ -121,6 +121,8 @@ class TreeInstanceDataset(Dataset):
         Transform to apply to images
     crop_to_bbox : bool
         If True, crop image to instance bbox. If False, use full image with mask (default: True)
+    excluded_classes : list of int, optional
+        Class labels to exclude from training (e.g., order/genus level classes)
     """
     
     def __init__(
@@ -131,6 +133,7 @@ class TreeInstanceDataset(Dataset):
         min_area: int = 100,
         transform=None,
         crop_to_bbox: bool = True,
+        excluded_classes: Optional[List[int]] = None,
     ):
         self.manifest_path = Path(manifest_path)
         self.output_root = Path(output_root)
@@ -138,14 +141,19 @@ class TreeInstanceDataset(Dataset):
         self.min_area = min_area
         self.transform = transform
         self.crop_to_bbox = crop_to_bbox
+        self.excluded_classes = set(excluded_classes) if excluded_classes else set()
         
         # Load instances from manifest
         self.instances = []
+        excluded_count = 0
         with self.manifest_path.open('r') as f:
             for line in f:
                 if line.strip():
                     instance = json.loads(line)
-                    # Filter by purity and area
+                    # Filter by purity, area, and excluded classes
+                    if instance['label'] in self.excluded_classes:
+                        excluded_count += 1
+                        continue
                     if instance['purity'] >= min_purity and instance['area'] >= min_area:
                         self.instances.append(instance)
         
@@ -154,6 +162,8 @@ class TreeInstanceDataset(Dataset):
         
         print(f"Loaded {len(self.instances)} instances from {manifest_path}")
         print(f"  Min purity: {min_purity:.2f}, Min area: {min_area}")
+        if excluded_count > 0:
+            print(f"  Excluded {excluded_count} instances from classes: {sorted(self.excluded_classes)}")
         
         # Compute label distribution
         label_counts = {}
@@ -238,6 +248,7 @@ def create_instance_dataloaders(
     min_purity: float = 0.7,
     min_area: int = 100,
     image_size: Tuple[int, int] = (224, 224),
+    excluded_classes: Optional[List[int]] = None,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Create train and validation dataloaders for instance classification.
@@ -260,6 +271,8 @@ def create_instance_dataloaders(
         Minimum area threshold
     image_size : Tuple[int, int]
         Target image size (H, W)
+    excluded_classes : list of int, optional
+        Class labels to exclude from training (e.g., order/genus level classes)
     
     Returns
     -------
@@ -277,6 +290,7 @@ def create_instance_dataloaders(
         min_area=min_area,
         transform=train_transform,
         crop_to_bbox=True,
+        excluded_classes=excluded_classes,
     )
     
     val_dataset = TreeInstanceDataset(
@@ -286,6 +300,7 @@ def create_instance_dataloaders(
         min_area=min_area,
         transform=val_transform,
         crop_to_bbox=True,
+        excluded_classes=excluded_classes,
     )
     
     train_loader = torch.utils.data.DataLoader(

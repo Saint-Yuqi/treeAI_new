@@ -177,15 +177,8 @@ def predict_instances_for_image(
         mask_pil = Image.fromarray((mask_crop * 255).astype(np.uint8))
         
         if transform:
-            try:
-                image_tensor, mask_tensor = transform(image_pil, mask_pil)
-            except TypeError:
-                import torchvision.transforms.functional as TF
-                seed = np.random.randint(2147483647)
-                torch.manual_seed(seed)
-                image_tensor = transform(image_pil)
-                torch.manual_seed(seed)
-                mask_tensor = TF.to_tensor(mask_pil)
+            # Transform expects to handle both image and mask
+            image_tensor, mask_tensor = transform(image_pil, mask_pil)
         else:
             import torchvision.transforms.functional as TF
             image_tensor = TF.to_tensor(image_pil)
@@ -349,6 +342,7 @@ def plot_confusion_matrix_semantic(
     save_path: Path,
     normalize: Optional[str] = None,
     title: str = 'Confusion Matrix',
+    include_background: bool = False,
 ):
     """
     Plot confusion matrix for semantic segmentation (pixel-level).
@@ -367,10 +361,19 @@ def plot_confusion_matrix_semantic(
         'true', 'pred', 'all', or None
     title : str
         Plot title
+    include_background : bool
+        If True, include class 0 (background) in the matrix
     """
-    # Get unique labels
-    labels = sorted(set(y_true) | set(y_pred))
-    labels = [l for l in labels if l != 0]  # Exclude background
+    # Get all known classes from class_names to ensure fixed matrix size
+    labels = sorted(class_names.keys())
+    
+    if not include_background:
+        labels = [l for l in labels if l != 0]  # Exclude background
+    
+    # Filter labels to only those present in data if we want a compact matrix? 
+    # The user specifically requested seeing ALL classes ("61 kinds"), so we stick to `labels` 
+    # derived from `class_names`. However, sklearn's confusion_matrix will complain or work fine 
+    # if labels are provided. It works fine.
     
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     
@@ -425,36 +428,63 @@ def compute_group_f1_scores(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     class_groups: Dict[str, List[int]],
+    ignore_classes: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     """
-    Compute F1 scores for class groups.
+    Compute F1 scores for class groups (macro average).
+    
+    For each group, compute F1 for each class in the group, then average.
+    This gives equal weight to each class regardless of frequency.
+    Classes in ignore_classes are excluded from calculation.
     
     Parameters
     ----------
     y_true : np.ndarray
-        Ground truth labels
+        Ground truth labels (can include background 0)
     y_pred : np.ndarray
-        Predicted labels
+        Predicted labels (can include background 0)
     class_groups : Dict[str, List[int]]
         Mapping from group name to list of class IDs
+    ignore_classes : List[int], optional
+        Classes to ignore (e.g., order/genus level classes).
+        These will be excluded from group F1 calculation.
     
     Returns
     -------
     group_f1_scores : Dict[str, float]
-        F1 score for each group
+        Macro-averaged F1 score for each group (uses nanmean to ignore NaN)
     """
     from sklearn.metrics import f1_score
+    
+    if ignore_classes is None:
+        ignore_classes = []
     
     group_f1_scores = {}
     
     for group_name, class_ids in class_groups.items():
-        # Create binary mask: is this pixel in the group?
-        true_in_group = np.isin(y_true, class_ids)
-        pred_in_group = np.isin(y_pred, class_ids)
+        # Filter out ignored classes (order/genus level)
+        valid_class_ids = [c for c in class_ids if c not in ignore_classes]
         
-        # Compute F1
-        f1 = f1_score(true_in_group, pred_in_group, average='binary', zero_division=0)
-        group_f1_scores[group_name] = f1
+        # Get classes that actually appear in the data
+        present_classes = [c for c in valid_class_ids if c in y_true or c in y_pred]
+        
+        if len(present_classes) == 0:
+            # No valid classes present in this group
+            group_f1_scores[group_name] = 0.0
+            continue
+        
+        # Compute per-class F1 for classes in this group
+        # zero_division=np.nan: classes with no samples get NaN (excluded from mean)
+        per_class_f1 = f1_score(
+            y_true, 
+            y_pred, 
+            labels=present_classes, 
+            average=None, 
+            zero_division=np.nan  # Use NaN for missing classes
+        )
+        
+        # Macro average: use nanmean to ignore NaN values (classes without samples)
+        group_f1_scores[group_name] = float(np.nanmean(per_class_f1))
     
     return group_f1_scores
 
