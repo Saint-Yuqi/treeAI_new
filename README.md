@@ -242,7 +242,57 @@ python train_instance_classifier.py \
 - Confusion matrices (4 variants)
 - Group F1 scores (bulk/medium/tail/dead-tree/invasive-alien)
 
-### Step 4: Evaluate
+### Step 4: Stage 2 - Fix Long-tail Performance (Optional)
+
+If your model struggles with tail classes (rare species), use **Decoupled Training** (Kang et al., ICLR 2020):
+
+```bash
+conda activate sam2
+python train_stage2_classifier.py \
+  --stage1-checkpoint ./outputs/instance_classifier/best_model.pt \
+  --output-dir ./outputs/instance_classifier_stage2 \
+  --epochs 30 \
+  --lr 1e-3 \
+  --sampling smoothed \
+  --smoothing-alpha 0.5 \
+  --reinit-classifier
+```
+
+**What it does:**
+1. **Freezes backbone** - keeps learned features from Stage 1
+2. **Reinitializes classifier** - removes bulk class bias  
+3. **Class-balanced sampling** - tail classes seen more often
+4. **Only trains classifier head** - faster, more stable
+
+**Sampling strategies (with sources):**
+- `smoothed` **(recommended)**: w = 1/n^α, adjustable strength (Kang et al. ICLR 2020)
+  - `--smoothing-alpha 0`: no rebalancing
+  - `--smoothing-alpha 0.5`: moderate (same as sqrt)
+  - `--smoothing-alpha 1.0`: full balanced
+- `sqrt`: w = 1/√n (classic heuristic)
+- `balanced`: w = 1/n (too aggressive if bulk >> tail)
+- `effective`: w = (1-β)/(1-β^n) (Cui et al. CVPR 2019)
+
+**Monitor these metrics:**
+- `val/mean_class_accuracy` - should improve (key metric)
+- `val/tail_accuracy` - should improve significantly  
+- `val/accuracy` - may drop slightly (expected trade-off)
+
+**Output structure (same as Stage 1):**
+```
+outputs/instance_classifier_stage2/
+├── best_model_stage2.pt          # Best checkpoint
+├── final_model_stage2.pt         # Final checkpoint
+├── stage2_config.json            # Stage 2 config
+└── test_results/                 # Auto-generated test results
+    ├── test_results.json         # Metrics JSON
+    ├── confusion.jpg             # Confusion matrix
+    ├── confusion_norm_true.jpg   # Normalized confusion
+    ├── qualitative_first.jpg     # Sample predictions
+    └── qualitative_last.jpg
+```
+
+### Step 5: Evaluate
 
 Evaluate the trained model on test set:
 
@@ -406,7 +456,17 @@ Built-in augmentations in `create_instance_dataloaders()`:
 4. **Increase training time**: 100 epochs instead of 50
 5. **Add more data**: Lower `min_purity` threshold carefully
 
-### 6. If Training is Slow
+### 6. If Tail Classes Fail (Long-tail Problem)
+Use **Stage 2 Decoupled Training** (Kang et al. ICLR 2020):
+```bash
+python train_stage2_classifier.py \
+  --stage1-checkpoint ./outputs/instance_classifier/best_model.pt \
+  --output-dir ./outputs/instance_classifier_stage2 \
+  --sampling smoothed --smoothing-alpha 0.5 --reinit-classifier
+```
+This freezes backbone and retrains classifier with balanced sampling. Adjust `--smoothing-alpha` (0-1) to control rebalancing strength.
+
+### 7. If Training is Slow
 1. **Use smaller encoder**: `efficientnet_b0` or `mobilenetv3_small`
 2. **Reduce image size**: `--image-size 128 128`
 3. **Increase batch size**: If GPU memory allows
@@ -615,7 +675,8 @@ treeAI_new/
 │   ├── model_prompted.py         # [Legacy] Semantic head
 │   ├── dataset.py                # [Legacy] Semantic dataset
 │   └── eval_treeai.py            # [Legacy] Evaluation utils
-├── train_instance_classifier.py  # Train instance classifier
+├── train_instance_classifier.py  # Stage 1: Train instance classifier
+├── train_stage2_classifier.py    # Stage 2: Retrain classifier (balanced sampling)
 ├── eval_instance_classifier.py   # Evaluate instance classifier
 ├── train.py                      # [Legacy] Train semantic model
 ├── test.py                       # [Legacy] Full semantic pipeline

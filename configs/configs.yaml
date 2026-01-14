@@ -1,0 +1,41 @@
+# Main configuration file for precompute_sam2_instances.py
+# This config is used by scripts/precompute_sam2_instances.py
+
+# Dataset configuration
+dataset:
+  # Root directory containing the dataset (should contain train/, val/, test/, pick/ subdirectories)
+  root: "/zfs/ai4good/datasets/tree/TreeAI/12_RGB_SemSegm_640_fL"
+  # Additional dataset roots (optional)
+  extra_roots: []
+  # Splits to process
+  splits: [train, val, test, pick]
+
+# Model configuration
+model:
+  # SAM2 checkpoint path
+  sam2_checkpoint: "/home/c/yuqyan/code/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_tree_finetune_full/checkpoints/checkpoint.pt"
+  # SAM2 config name (will be resolved from sam2 module)
+  sam2_config: "/home/c/yuqyan/code/sam2/sam2/configs/sam2.1_training/sam2.1_hiera_b+_tree_finetune_full.yaml"
+
+# RSPrompter configuration
+rsprompter:
+  # Directory containing bbox prompts (rsprompter_prompts/<dataset_name>/<split>/*.json)
+  bbox_prompt_dir: "./rsprompter_prompts"
+
+# Precompute configuration
+precompute:
+  # Output directory for SAM2 instances
+  output_dir: "./sam2_instances"
+  # Minimum mask area in pixels
+  min_area: 100
+  # Minimum overlap with groundtruth (for filtering)
+  min_overlap: 0.3
+  # IoU threshold for deduplication: if a mask overlaps with already-claimed
+  # pixels by more than this ratio, it is discarded (keeps best mask per tree)
+  iou_threshold: 0.7
+  # Optional: filter to specific dataset name (e.g., "12_RGB_SemSegm_640_fL")
+  # Leave as null to process all datasets found in dataset.root
+  dataset_filter: null
+  # Whether to overwrite existing outputs
+  overwrite: false
+

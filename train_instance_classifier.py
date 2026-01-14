@@ -222,6 +222,7 @@ def generate_visualizations(
     device: torch.device,
     image_size: Tuple[int, int],
     use_wandb: bool = False,
+    epoch: Optional[int] = None,
 ):
     """Generate qualitative visualizations for pick dataset."""
     model.eval()
@@ -364,16 +365,21 @@ def generate_visualizations(
         import wandb
         
         # Log images
-        wandb.log({
+        log_dict = {
             'qualitative/first': wandb.Image(str(output_dir / 'qual_first.jpg')),
             'qualitative/last': wandb.Image(str(output_dir / 'qual_last.jpg')),
             'confusion/raw': wandb.Image(str(output_dir / 'confusion.jpg')),
             'confusion/norm_true': wandb.Image(str(output_dir / 'confusion_norm_true.jpg')),
-        })
+        }
         
         # Log group F1 scores
         for group_name, f1 in group_f1.items():
-            wandb.log({f'group_f1/{group_name}': f1})
+            log_dict[f'group_f1/{group_name}'] = f1
+        
+        if epoch is not None:
+            wandb.log(log_dict, step=epoch)
+        else:
+            wandb.log(log_dict)
     
     print(f"✅ Visualizations saved to: {output_dir}")
 
@@ -1006,7 +1012,7 @@ def main():
                 'val/accuracy': val_metrics['accuracy'],
                 'val/mean_class_accuracy': val_metrics['mean_class_accuracy'],
                 'lr': optimizer.param_groups[0]['lr'],
-            })
+            }, step=epoch + 1)
         
         # Update learning rate
         scheduler.step()
@@ -1026,6 +1032,7 @@ def main():
                 device=device,
                 image_size=tuple(args.image_size),
                 use_wandb=args.use_wandb,
+                epoch=epoch + 1,
             )
 
         # Run Full Validation (matches test set protocol)

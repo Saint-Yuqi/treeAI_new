@@ -8,7 +8,7 @@ Usage (single dataset):
         --config /home/c/yuqyan/code/RSPrompter/configs/treeai/rsprompter_anchor_treeai.py \
         --checkpoint /home/c/yuqyan/code/RSPrompter/work_dirs/treeai/rsprompter_0_12_fully_labeled/best_coco_bbox_mAP_epoch_50.pth\
         --dataset-root /home/c/yuqyan/data/TreeAI/12_RGB_SemSegm_640_fL\
-        --split train val test pick\
+        --splits train val test pick\
         --output-base-dir ./rsprompter_prompts/12_RGB_SemSegm_640_fL
 
 Usage (batch processing):

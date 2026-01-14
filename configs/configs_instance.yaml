@@ -40,7 +40,7 @@ model:
   
   # Encoder architecture (any timm model)
   # Options: resnet50, efficientnet_b0, efficientnet_b4, convnext_small, etc.
-  encoder: "resnet50"
+  encoder: "convnext_small"
   
   # Use ImageNet pretrained weights
   pretrained: true
@@ -126,6 +126,36 @@ precompute:
   output_dir: "./sam2_instances"
   min_area: 100
   min_overlap: 0.5
+
+# Stage 2: Decoupled Classifier Training (for long-tail distribution)
+# Use train_stage2_classifier.py after Stage 1 training
+stage2:
+  # Stage 1 checkpoint to load backbone from
+  stage1_checkpoint: null  # e.g., "./outputs/instance_classifier/best_model.pt"
+  
+  # Output directory for Stage 2
+  output_dir: "./outputs/instance_classifier_stage2"
+  
+  # Training params (shorter training, higher LR for classifier)
+  epochs: 30
+  lr: 1.0e-3  # Higher LR since only classifier is trained
+  batch_size: 64
+  
+  # Sampling strategy: 'smoothed' (recommended), 'balanced', 'sqrt', or 'effective'
+  # 
+  # Sources:
+  # - smoothed: w=1/n^α from Kang et al. ICLR 2020 "Decoupling" (RECOMMENDED)
+  # - balanced: w=1/n, classic inverse frequency (too aggressive for large imbalance)
+  # - sqrt: w=1/√n, common heuristic
+  # - effective: w=(1-β)/(1-β^n) from Cui et al. CVPR 2019
+  #
+  # smoothed with α=0.5 is recommended for large bulk/tail gaps
+  sampling: "smoothed"
+  smoothing_alpha: 0.5  # 0=no rebalancing, 0.5=sqrt, 1=full balanced
+  effective_beta: 0.999  # Only for 'effective' strategy
+  
+  # Reinitialize classifier head (recommended)
+  reinit_classifier: true
 
 # Recommended configurations for different scenarios
 # 

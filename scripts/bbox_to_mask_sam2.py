@@ -8,16 +8,18 @@
         --sam2_config /path/to/sam2_config.yaml \
         --device cuda
 
-输出:
-    默认保存到 /zfs/ai4good/student/yuqyan/treeAI/{dataset_name}/
+输出路径:
+    默认输出目录: /zfs/ai4good/datasets/tree/TreeAI/{dataset_name}/
+    可通过 --output_base_dir 参数自定义输出根目录
+    
     数据集名称自动从 data_dir 路径提取（例如: 0_RGB_fL_processed_coco）
     
     输出目录结构:
-        {output_dir}/
+        {output_base_dir}/{dataset_name}/
         ├── train/
-        │   ├── images/  (软链接到原始图像)
-        │   ├── labels_txt/  (软链接到原始标签)
-        │   └── labels/      (生成的SAM2像素级labels，PNG)
+        │   ├── images/      (软链接到原始图像)
+        │   ├── labels_txt/  (软链接到原始txt/xml标签)
+        │   └── labels/      (生成的SAM2像素级labels，PNG或TIF)
         ├── val/
         │   ├── images/
         │   ├── labels_txt/
@@ -26,6 +28,11 @@
             ├── images/
             ├── labels_txt/
             └── labels/
+    
+    注意:
+    - 完整标注模式: labels/ 中为 PNG 格式（背景=0）
+    - 部分标注模式: labels/ 中为 TIF 格式（未标注=-1，背景=0）
+      使用 --partial_annotation 启用部分标注模式
 """
 
 import os
@@ -313,7 +320,34 @@ def ensure_symlink(source_path, target_path, description="file"):
         print(f"Warning: Failed to create symlink for {description} ({source_path} -> {target_path}): {exc}")
 
 
-def create_label_map_from_sam2(image_path, bboxes, sam2_predictor, restrict_to_bbox=True, dtype=np.uint8):
+def sort_bboxes_by_area(bboxes, ascending=False):
+    """
+    按面积排序bboxes（用于Z-Order控制）
+    
+    Args:
+        bboxes: list of (x1, y1, x2, y2, class_id)
+        ascending: True=小到大（小框先画），False=大到小（大框先画，小框覆盖）
+    
+    Returns:
+        排序后的bboxes列表
+    """
+    def bbox_area(bbox):
+        x1, y1, x2, y2, _ = bbox
+        return (x2 - x1) * (y2 - y1)
+    
+    return sorted(bboxes, key=bbox_area, reverse=not ascending)
+
+
+def create_label_map_from_sam2(
+    image_path,
+    bboxes,
+    sam2_predictor,
+    restrict_to_bbox=True,
+    bbox_margin=0.15,
+    sort_by_area=True,
+    dtype=np.uint8,
+    partial_annotation=False,
+):
     """
     使用SAM2为bbox生成像素级标签
     
@@ -321,11 +355,18 @@ def create_label_map_from_sam2(image_path, bboxes, sam2_predictor, restrict_to_b
         image_path: 图像路径
         bboxes: list of (x1, y1, x2, y2, class_id) 像素坐标
         sam2_predictor: SAM2ImagePredictor实例
-        restrict_to_bbox: 是否将预测限制在bbox框内
+        restrict_to_bbox: 是否将预测限制在bbox框内（带margin）
+        bbox_margin: bbox扩展margin比例（0.15=15%），仅当restrict_to_bbox=True时生效
+                     允许SAM2预测超出bbox一定比例，解决人工标注不精确的问题
+        sort_by_area: 是否按面积排序（大框先画，小框后画覆盖），
+                      用于正确处理重叠树木的前后遮挡关系
         dtype: 输出标签图的numpy dtype
+        partial_annotation: 是否为部分标注模式，若True则未标注区域标为-1
     
     Returns:
-        label_map: numpy array (H, W), 像素值为类别ID（背景=0）
+        label_map: numpy array (H, W), 像素值为类别ID
+                   - 完整标注模式(partial_annotation=False): 背景=0
+                   - 部分标注模式(partial_annotation=True): 未标注=-1, 背景=0
     """
     # 加载图像
     image = cv2.imread(image_path)
@@ -336,12 +377,24 @@ def create_label_map_from_sam2(image_path, bboxes, sam2_predictor, restrict_to_b
     
     dtype = np.dtype(dtype)
 
-    # 初始化标签图，默认背景=0
-    label_map = np.zeros((height, width), dtype=dtype)
+    # 初始化标签图
+    # 部分标注模式：未标注区域=-1；完整标注模式：背景=0
+    if partial_annotation:
+        label_map = np.full((height, width), -1, dtype=dtype)
+    else:
+        label_map = np.zeros((height, width), dtype=dtype)
+    
     if len(bboxes) == 0:
         return label_map
     
-    dtype_max = np.iinfo(dtype).max
+    dtype_info = np.iinfo(dtype)
+    dtype_max = dtype_info.max
+    dtype_min = dtype_info.min
+    
+    # Z-Order优化：按面积排序，大框先画，小框后画（覆盖大框）
+    # 这样小树的mask会覆盖在大树之上，符合视觉遮挡关系
+    if sort_by_area:
+        bboxes = sort_bboxes_by_area(bboxes, ascending=False)
    
     # 设置SAM2的图像（只需要设置一次）
     sam2_predictor.set_image(image_rgb)
@@ -368,25 +421,45 @@ def create_label_map_from_sam2(image_path, bboxes, sam2_predictor, restrict_to_b
             sam_mask = masks[0].astype(bool)
             
             if restrict_to_bbox:
-                # 创建bbox矩形区域
-                bbox_mask = np.zeros((height, width), dtype=bool)
-                bbox_mask[y1:y2+1, x1:x2+1] = True
+                # 计算带margin的扩展bbox（允许SAM2预测超出原始bbox一定比例）
+                # 这解决了人工标注不精确、树枝延伸出框等问题
+                bbox_w = x2 - x1
+                bbox_h = y2 - y1
+                margin_x = int(bbox_w * bbox_margin)
+                margin_y = int(bbox_h * bbox_margin)
                 
-                # 将SAM2区域限制在bbox框内
+                # 扩展后的bbox坐标（限制在图像范围内）
+                exp_x1 = max(0, x1 - margin_x)
+                exp_y1 = max(0, y1 - margin_y)
+                exp_x2 = min(width - 1, x2 + margin_x)
+                exp_y2 = min(height - 1, y2 + margin_y)
+                
+                # 创建扩展后的bbox区域
+                bbox_mask = np.zeros((height, width), dtype=bool)
+                bbox_mask[exp_y1:exp_y2+1, exp_x1:exp_x2+1] = True
+                
+                # 将SAM2区域限制在扩展后的bbox框内
                 sam_mask = sam_mask & bbox_mask
             
-            # 对于重叠区域，后处理的bbox会覆盖先前的（或者可以按面积优先）
-            # 这里采用简单策略：后处理的覆盖先前的
-            # 将SAM2生成的区域设置为对应的类别ID（覆盖背景0）
+            # Z-Order处理：后处理的小框会覆盖先处理的大框
+            # 将SAM2生成的区域设置为对应的类别ID
             if class_id > dtype_max:
                 raise ValueError(f"Class ID {class_id} exceeds dtype capacity ({dtype_max})")
             label_map[sam_mask] = class_id
             
         except Exception as e:
             print(f"Warning: Failed to process bbox {box} for class {class_id}: {e}")
-            # 如果SAM2失败，至少填充bbox矩形区域
+            # 如果SAM2失败，至少填充bbox矩形区域（带margin）
             if restrict_to_bbox:
-                label_map[y1:y2+1, x1:x2+1] = class_id
+                bbox_w = x2 - x1
+                bbox_h = y2 - y1
+                margin_x = int(bbox_w * bbox_margin)
+                margin_y = int(bbox_h * bbox_margin)
+                fb_x1 = max(0, x1 - margin_x)
+                fb_y1 = max(0, y1 - margin_y)
+                fb_x2 = min(width - 1, x2 + margin_x)
+                fb_y2 = min(height - 1, y2 + margin_y)
+                label_map[fb_y1:fb_y2+1, fb_x1:fb_x2+1] = class_id
     
     return label_map
 
@@ -397,8 +470,11 @@ def process_dataset(
     output_dir,
     split='val',
     restrict_to_bbox=True,
+    bbox_margin=0.15,
+    sort_by_area=True,
     valid_class_ids=None,
     label_dtype=np.uint8,
+    partial_annotation=False,
     dataset_name=None,
     skip_log_path=None,
 ):
@@ -410,12 +486,18 @@ def process_dataset(
         sam2_predictor: SAM2ImagePredictor实例
         output_dir: 输出根目录（将创建 {split}/images/labels_txt/labels 结构）
         split: 'train', 'val' 或 'test'
-        restrict_to_bbox: 是否将SAM2预测限制在bbox边界内
+        restrict_to_bbox: 是否将SAM2预测限制在bbox边界内（带margin）
+        bbox_margin: bbox扩展margin比例（默认0.15=15%）
+        sort_by_area: 是否按面积排序bbox（大框先画，小框后覆盖）
         valid_class_ids: 需要保留的类别ID集合（其余bbox将被丢弃）
         label_dtype: 保存标签PNG的dtype（默认为uint8）
+        partial_annotation: 是否为部分标注模式（未标注区域=-1，输出TIF格式）
         dataset_name: 当前数据集名称，用于日志
         skip_log_path: 跳过样本的日志路径
     """
+    # 部分标注模式必须使用有符号整数类型以支持-1
+    if partial_annotation:
+        label_dtype = np.int16
     label_dtype = np.dtype(label_dtype)
 
     images_dir = os.path.join(data_dir, split, 'images')
@@ -440,17 +522,25 @@ def process_dataset(
     image_files = sorted(image_files)
     print(f"Found {len(image_files)} images in {split} split")
     
+    # 确定输出标签格式：部分标注用TIF（支持-1），完整标注用PNG
+    seg_label_ext = '.tif' if partial_annotation else '.png'
+    
     # 处理每张图像
     for image_path in tqdm(image_files, desc=f"Processing {split}"):
         # 获取对应的标签文件（支持 txt 和 xml）
         txt_label_path = os.path.join(labels_dir, image_path.stem + '.txt')
         xml_label_path = os.path.join(labels_dir, image_path.stem + '.xml')
-        seg_label_path = os.path.join(output_seg_labels_dir, image_path.stem + '.png')
+        seg_label_path = os.path.join(output_seg_labels_dir, image_path.stem + seg_label_ext)
         output_image_path = os.path.join(output_images_dir, image_path.name)
         possible_label_symlinks = [
             os.path.join(output_labels_txt_dir, image_path.stem + '.txt'),
             os.path.join(output_labels_txt_dir, image_path.stem + '.xml'),
         ]
+        # 旧格式的seg label文件（用于清理格式切换后的残留）
+        old_seg_label_path = os.path.join(
+            output_seg_labels_dir,
+            image_path.stem + ('.png' if partial_annotation else '.tif')
+        )
         
         label_path = None
         label_format = None
@@ -463,7 +553,7 @@ def process_dataset(
         
         if not label_path:
             log_skipped_sample(skip_log_path, dataset_name, split, image_path.name, 'label_missing')
-            cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path)
+            cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path, old_seg_label_path)
             continue
         
         with Image.open(image_path) as pil_img:
@@ -485,7 +575,7 @@ def process_dataset(
             yolo_bboxes = load_yolo_labels(label_path, valid_class_ids)
             if len(yolo_bboxes) == 0:
                 log_skipped_sample(skip_log_path, dataset_name, split, image_path.name, 'no_valid_bbox')
-                cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path)
+                cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path, old_seg_label_path)
                 continue
             pixel_bboxes = [
                 yolo_to_pixel_coords(bbox, img_width, img_height)
@@ -495,13 +585,14 @@ def process_dataset(
             pixel_bboxes = load_pascal_voc_bboxes(label_path, img_width, img_height, valid_class_ids)
             if len(pixel_bboxes) == 0:
                 log_skipped_sample(skip_log_path, dataset_name, split, image_path.name, 'no_valid_bbox')
-                cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path)
+                cleanup_output_files(output_image_path, *possible_label_symlinks, seg_label_path, old_seg_label_path)
                 continue
         
-        # 清理可能存在的其它标签扩展名
+        # 清理可能存在的其它标签扩展名和旧格式seg label
         for candidate in possible_label_symlinks:
             if os.path.basename(candidate) != label_basename:
                 cleanup_output_files(candidate)
+        cleanup_output_files(old_seg_label_path)  # 清理旧格式残留
         
         # 创建图像软链接（如果不存在）
         ensure_symlink(image_path, output_image_path, description="image")
@@ -515,13 +606,22 @@ def process_dataset(
             pixel_bboxes,
             sam2_predictor,
             restrict_to_bbox=restrict_to_bbox,
+            bbox_margin=bbox_margin,
+            sort_by_area=sort_by_area,
             dtype=label_dtype,
+            partial_annotation=partial_annotation,
         )
         
-        # 保存标签PNG
-        pil_mode = 'L' if label_dtype == np.uint8 else 'I;16'
-        label_image = Image.fromarray(label_map.astype(label_dtype), mode=pil_mode)
-        label_image.save(seg_label_path)
+        # 保存标签图
+        if partial_annotation:
+            # 部分标注模式：保存为TIF格式（支持有符号整数，-1表示未标注）
+            # 使用cv2保存以确保正确处理int16
+            cv2.imwrite(seg_label_path, label_map.astype(np.int16))
+        else:
+            # 完整标注模式：保存为PNG格式
+            pil_mode = 'L' if label_dtype == np.uint8 else 'I;16'
+            label_image = Image.fromarray(label_map.astype(label_dtype), mode=pil_mode)
+            label_image.save(seg_label_path)
 
 
 def extract_dataset_name(data_dir):
@@ -573,20 +673,30 @@ def main():
                        help='Multiple data directories to process (e.g., --data_dirs /path/to/dataset1 /path/to/dataset2)')
     parser.add_argument('--data_list', type=str, default=None,
                        help='File containing list of data directories (one per line)')
-    parser.add_argument('--sam2_checkpoint', type=str, default=None,
+    parser.add_argument('--sam2_checkpoint', type=str, default="/home/c/yuqyan/code/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_tree_finetune_full/checkpoints/checkpoint.pt",
                        help='Path to SAM2 checkpoint file (overrides config)')
-    parser.add_argument('--sam2_config', type=str, default=None,
+    parser.add_argument('--sam2_config', type=str, default="/home/c/yuqyan/code/sam2/sam2/configs/sam2.1_training/sam2.1_hiera_b+_tree_finetune_full.yaml",
                        help='SAM2 config file name or full path (overrides config)')
-    parser.add_argument('--output_base_dir', type=str, default=None,
+    parser.add_argument('--output_base_dir', type=str, default="/zfs/ai4good/datasets/tree/TreeAI/TreeAI_new",
                        help='Base directory for output (overrides config)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda or cpu, overrides config)')
     parser.add_argument('--splits', type=str, nargs='+', default=None,
                        help='Data splits to process (e.g., train val test, overrides per-dataset splits in config)')
     parser.add_argument('--restrict_to_bbox', action='store_true', default=None,
-                       help='Restrict SAM2 label predictions to bbox boundaries')
+                       help='Restrict SAM2 label predictions to bbox boundaries (with margin)')
     parser.add_argument('--no_restrict_to_bbox', dest='restrict_to_bbox', action='store_false',
                        help='Allow SAM2 label predictions to extend beyond bbox boundaries')
+    parser.add_argument('--bbox_margin', type=float, default=None,
+                       help='BBox margin ratio (default 0.15=15%%). Allows SAM2 predictions to extend beyond '
+                            'bbox by this proportion. Helps with imprecise manual annotations.')
+    parser.add_argument('--sort_by_area', action='store_true', default=None,
+                       help='Sort bboxes by area (large first) for correct Z-order occlusion handling')
+    parser.add_argument('--no_sort_by_area', dest='sort_by_area', action='store_false',
+                       help='Process bboxes in original order without area-based sorting')
+    parser.add_argument('--partial_annotation', action='store_true', default=False,
+                       help='Partial annotation mode: output TIF format with -1 for unlabeled areas. '
+                            'Use this when only some objects are annotated in each image.')
     parser.add_argument('--analyze_labels', action='store_true',
                        help='Print class distribution summary for each dataset based on YOLO labels.')
     parser.add_argument('--auto_update_value_mapping', action='store_true',
@@ -624,9 +734,23 @@ def main():
     # Merge config with command line arguments (CLI args take precedence)
     sam2_checkpoint = args.sam2_checkpoint or config.get('sam2', {}).get('checkpoint')
     sam2_config = args.sam2_config or config.get('sam2', {}).get('config')
-    output_base_dir = args.output_base_dir or config.get('output', {}).get('base_dir', '/zfs/ai4good/student/yuqyan/treeAI')
+    output_base_dir = args.output_base_dir or config.get('output', {}).get('base_dir', '/zfs/ai4good/datasets/tree/TreeAI')
     device = args.device or config.get('device', 'cuda')
     restrict_to_bbox = args.restrict_to_bbox if args.restrict_to_bbox is not None else config.get('restrict_to_bbox', True)
+    bbox_margin = args.bbox_margin if args.bbox_margin is not None else config.get('bbox_margin', 0.15)
+    sort_by_area = args.sort_by_area if args.sort_by_area is not None else config.get('sort_by_area', True)
+    partial_annotation = args.partial_annotation or config.get('partial_annotation', False)
+    
+    # Print output directory information
+    print(f"\n{'='*60}")
+    print(f"Output Configuration")
+    print(f"{'='*60}")
+    print(f"Base output directory: {output_base_dir}")
+    print(f"  → Final output will be: {output_base_dir}/<dataset_name>/<split>/")
+    print(f"     - images/      (symlinks to original images)")
+    print(f"     - labels_txt/  (symlinks to original txt/xml annotations)")
+    print(f"     - labels/       (generated SAM2 segmentation labels)")
+    print(f"{'='*60}\n")
     
     # Collect datasets to process
     datasets_to_process = []
@@ -712,7 +836,12 @@ def main():
     dtype_name = 'uint8' if label_dtype == np.uint8 else 'uint16'
     skip_log_path = DEFAULT_SKIP_LOG_PATH
     print(f"Valid class IDs: {len(valid_class_ids)} loaded from {args.class_config_path} (max={max_class_id}).")
-    print(f"Segmentation labels will be saved as {dtype_name} PNGs (background=0).\n")
+    if partial_annotation:
+        print(f"Partial annotation mode: labels saved as int16 TIF (unlabeled=-1, background=0)")
+    else:
+        print(f"Full annotation mode: labels saved as {dtype_name} PNG (background=0)")
+    print(f"BBox margin: {bbox_margin:.0%} (restrict_to_bbox={restrict_to_bbox})")
+    print(f"Z-order sorting by area: {sort_by_area}\n")
     
     # Validate SAM2 checkpoint and config
     if not sam2_checkpoint:
@@ -800,8 +929,11 @@ def main():
                     output_dir,
                     split=split,
                     restrict_to_bbox=restrict_to_bbox,
+                    bbox_margin=bbox_margin,
+                    sort_by_area=sort_by_area,
                     valid_class_ids=valid_class_ids,
                     label_dtype=label_dtype,
+                    partial_annotation=partial_annotation,
                     dataset_name=final_dataset_name,
                     skip_log_path=skip_log_path,
                 )
